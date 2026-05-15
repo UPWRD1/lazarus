@@ -1,0 +1,8 @@
+[package]
+name = "lazarus_lib"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+markov = "1.1.0"
+rand = { version = "0.10.1", features = ["simd_support"] }
