@@ -1,5 +1,3 @@
-#![feature(associated_type_defaults)]
-#![feature(portable_simd)]
 pub mod algo;
 
 pub fn add(left: u64, right: u64) -> u64 {

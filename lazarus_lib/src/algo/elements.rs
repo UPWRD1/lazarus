@@ -1,105 +1,172 @@
-use std::{ops::Mul, simd::u32x64};
+use itertools::Itertools;
+use std::{collections::HashMap, sync::Arc};
 
-use rand::RngExt;
-
-pub trait Element {
-    // fn value(&self);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Element<T> {
+    Unit { of: T },
+    Repetition { of: Arc<Self> },
+    Sequence { of: Vec<Arc<Self>> },
 }
 
-struct Repetition<T, const N: usize>
-where
-    T: Element,
-{
-    of: T,
-    len: usize,
-}
-
-struct Sequence<const N: usize> {
-    of: [Box<dyn Element>; N],
-}
-
-pub fn autocorrelate(signal: &[f32]) -> Vec<f32> {
-    let n = signal.len();
-    if n == 0 {
-        return Vec::new();
+impl<T: ToString> ToString for Element<T> {
+    fn to_string(&self) -> String {
+        match self {
+            Element::Unit { of } => of.to_string(),
+            Element::Repetition { of } => format!("Rep[{}]", of.to_string()),
+            Element::Sequence { of } => {
+                format!("Seq[{}]", of.iter().map(|v| v.to_string()).join(","))
+            }
+        }
     }
+}
 
-    let mut results = Vec::with_capacity(n);
+struct Lens<T: Clone> {
+    width: usize,
+    filters: Vec<Box<dyn Filter<T>>>,
+}
 
-    // Iterate through each possible lag (k)
-    for lag in 0..n {
-        let mut sum = 0.0;
+impl<T: Clone> Lens<T> {
+    fn view(self, data: &[Element<T>]) -> Viewing<T> {
+        let content = data
+            .windows(self.width)
+            // .circular_array_windows::<WIDTH>()
+            .enumerate()
+            .map(|(i, window)| {
+                (
+                    i,
+                    self.filters
+                        .iter()
+                        .filter_map(|f| f.filter(window.clone()))
+                        .collect_vec(),
+                )
+            })
+            .collect_vec();
 
-        // Multiply each element by its lagged counterpart and sum them up
-        for i in 0..(n - lag) {
-            sum += signal[i] * signal[i + lag];
+        let mut results: HashMap<usize, Vec<Element<_>>> = HashMap::new();
+
+        for (i, mut v) in content {
+            if v.is_empty() {
+                continue;
+            }
+            results
+                .entry(i)
+                .and_modify(|map_v| map_v.append(&mut v))
+                .or_insert_with(|| v);
         }
 
-        results.push(sum);
+        Viewing {
+            width: self.width,
+            results,
+        }
     }
-
-    results
 }
 
-pub fn autocorrelate_simd(signal: impl Into<std::simd::u32x64>, lag: u32) -> u32 {
-    let signal = signal.into();
-    let lag_simd = std::simd::u32x64::splat(lag);
-    //     if lag >= 64 {
-    //     return 0;
-    // }
-
-    // Shift the signal to create the lagged version
-    let shifted = signal >> lag_simd;
-
-    // XNOR finds matching bits.
-    // We mask it because the shift introduced 0s at the top, which aren't part of the signal overlap.
-    let valid_bits_mask = !u32x64::splat(0) >> lag_simd;
-    let matching_bits = !(signal ^ shifted) & valid_bits_mask;
-
-    // Count how many bits matched over the overlapping window
-    let count: u32 = matching_bits
-        .to_array()
-        .iter()
-        .map(|a| a.count_ones())
-        .sum();
-    count * 2 - lag
+trait Filter<T> {
+    fn filter(&self, window: &[Element<T>]) -> Option<Element<T>>;
 }
 
-pub fn analyze(elems: &[Box<dyn Element>]) -> Box<dyn Element> {
-    todo!()
+struct RepeatFilter;
+
+impl<T: PartialEq + Clone> Filter<T> for RepeatFilter {
+    fn filter(&self, window: &[Element<T>]) -> Option<Element<T>> {
+        if window.iter().all_equal() {
+            Some(Element::Repetition {
+                of: Arc::new(window.first().unwrap().clone()),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+struct SequenceFilter;
+
+impl<T: PartialEq + Clone + std::fmt::Debug> Filter<T> for SequenceFilter {
+    fn filter(&self, window: &[Element<T>]) -> Option<Element<T>> {
+        if window
+            .windows(2)
+            .map(|slice| slice[0] != slice[1])
+            .all_equal()
+        {
+            Some(Element::Sequence {
+                of: window.into_iter().map(|v| Arc::new(v.clone())).collect(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+struct Viewing<T> {
+    width: usize,
+    results: HashMap<usize, Vec<Element<T>>>,
+}
+
+impl<T: ToString> Viewing<T> {
+    fn pretty_print(&self) {
+        println!("Viewing size {}", self.width);
+        for (i, v) in self.results.iter() {
+            println!("pos: {i}");
+            let elements = v.iter().map(|e| e.to_string()).join(", ");
+            print!("\t {elements}");
+            println!("\n")
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use bitvec::vec::BitVec;
+    use itertools::Itertools;
     use rand::RngExt;
 
-    use crate::algo::elements::autocorrelate_simd;
+    use crate::algo::elements::{Element, Lens, RepeatFilter, SequenceFilter};
+
+    pub fn random_signal() -> BitVec {
+        let mut rng = rand::rng();
+        const LEN: usize = 128;
+        let signal: BitVec = {
+            let mut s = BitVec::new();
+
+            for _ in 0..LEN {
+                let b = rng.random_range(0..2) == 0;
+                s.push(b)
+            }
+            s
+        };
+        println!("Signal: {:?}", signal);
+        signal
+    }
 
     #[test]
-    fn test1() {
-        use plotly::{Plot, Scatter};
-        // Example 64-bit signal
-        let mut rng = rand::rng();
-        let signal: std::simd::u32x64 = rng.random();
-        println!("Signal: {:?}", signal.to_array());
-        // let ac = crate::algo::elements::autocorrelate(&signal);
+    fn repfilter() {
+        let signal = random_signal();
+        let element_ified = signal.iter().map(|v| Element::Unit { of: v }).collect_vec();
 
-        // println!("Original signal: {:?}", signal);
-        // println!("Autocorrelation: ");
-        let auto_correlations: Vec<_> = (0..32)
-            .map(|lag| {
-                let value = autocorrelate_simd(signal, lag);
-                println!("Lag {}: {:.4}", lag, value);
-                value
-            })
-            .collect();
+        for i in 3..10 {
+            let lens: Lens<_> = Lens {
+                width: i,
+                filters: vec![Box::new(RepeatFilter)],
+            };
+            let res = lens.view(&element_ified);
 
-        let mut plot = Plot::new();
-        let x_axis: [u32; 64] = std::array::from_fn(|i| i as u32);
+            res.pretty_print();
+        }
+    }
 
-        let trace = Scatter::new(x_axis.to_vec(), auto_correlations.to_vec());
-        plot.add_trace(trace);
+    #[test]
+    fn seqfilter() {
+        let signal = random_signal();
+        let element_ified = signal.iter().map(|v| Element::Unit { of: v }).collect_vec();
 
-        plot.write_html("out.html");
+        for i in 4..5 {
+            let lens: Lens<_> = Lens {
+                width: i,
+                filters: vec![Box::new(SequenceFilter)],
+            };
+            let res = lens.view(&element_ified);
+
+            res.pretty_print();
+        }
     }
 }
